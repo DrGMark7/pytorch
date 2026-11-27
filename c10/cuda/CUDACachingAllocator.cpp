@@ -7,6 +7,16 @@
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAGuard.h>
+#if defined(__linux__) && !defined(USE_ROCM)
+#include <c10/cuda/JudementPolicyV2.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <c10/cuda/PeerToPeerAccess.h>
 #include <c10/cuda/impl/CUDAGraphMemory.h>
 #include <c10/util/Gauge.h>
@@ -40,18 +50,23 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <functional>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <ranges>
 #include <set>
+#include <sstream>
 #include <stack>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -108,6 +123,198 @@ static int get_self_pid() {
 #endif // defined(PYTORCH_C10_DRIVER_API_SUPPORTED) || defined(USE_ROCM)
 
 namespace Native {
+
+#if defined(__linux__) && !defined(USE_ROCM)
+namespace {
+class JudementPolicyReader {
+ public:
+  void initialize(int device_count) {
+    if (device_count == 0) return;
+    std::call_once(init_once_, [this, device_count] {
+      const auto mode = c10::utils::get_env("JUDEMENT_POLICY_MODE");
+      if (!mode.has_value() || *mode == "off") return;
+      strict_.store(true, std::memory_order_release);
+      TORCH_CHECK(*mode == "mmap_v2", "Judement: unsupported policy mode ", *mode);
+      const auto local_pid = getpid();
+      const auto local_ticks = process_start_ticks(local_pid);
+      if (local_ticks == 0) return;
+      std::array<int, judement::kMaxDevices> local_slots;
+      local_slots.fill(-1);
+      const auto path = c10::utils::get_env("JUDEMENT_POLICY_PATH");
+      if (!path.has_value() || path->empty() || device_count > static_cast<int>(judement::kMaxDevices)) return;
+      const int fd = open(path->c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd < 0) return;
+      struct stat stat_buffer {};
+      const bool size_ok = fstat(fd, &stat_buffer) == 0 && stat_buffer.st_size == static_cast<off_t>(judement::kPolicySize);
+      if (!size_ok) { close(fd); return; }
+      void* mapping = mmap(nullptr, judement::kPolicySize, PROT_READ, MAP_SHARED, fd, 0);
+      close(fd);
+      if (mapping == MAP_FAILED) return;
+      auto unmap = [](void* p) { munmap(p, judement::kPolicySize); };
+      std::unique_ptr<void, decltype(unmap)> mapping_guard(mapping, unmap);
+      const auto* policy = static_cast<const judement::Policy*>(mapping);
+      if (memcmp(policy->header.magic, judement::kMagic, sizeof(judement::kMagic)) != 0 || policy->header.version != 2 || policy->header.header_size != 64 || policy->header.pid_capacity != static_cast<uint32_t>(judement::kPidCapacity) || policy->header.num_devices > static_cast<uint32_t>(judement::kMaxDevices)) return;
+      for (int device = 0; device < device_count; ++device) {
+        cudaDeviceProp properties {};
+        if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) return;
+        for (uint32_t slot = 0; slot < policy->header.num_devices; ++slot) {
+          if (memcmp(properties.uuid.bytes, policy->devices[slot].uuid, 16) == 0) { local_slots[device] = static_cast<int>(slot); break; }
+        }
+      }
+      uint64_t local_generation = 0, local_writer_start = 0;
+      int32_t local_writer_pid = 0;
+      bool stable = false;
+      for (int attempt = 0; attempt < 4096; ++attempt) {
+        const auto before = judement::load(&policy->header.sequence);
+        if (before & 1) {
+#if defined(__i386__) || defined(__x86_64__)
+          __builtin_ia32_pause();
+#endif
+          continue;
+        }
+        const auto generation = judement::load(&policy->header.server_generation);
+        const auto writer_pid = judement::load(&policy->header.writer_pid);
+        const auto writer_start = judement::load(&policy->header.writer_start_ticks);
+        const auto after = judement::load(&policy->header.sequence);
+        if (before == after && !(after & 1)) {
+          if (generation == 0 || writer_pid <= 0 || writer_start == 0) return;
+          local_generation = generation; local_writer_pid = writer_pid; local_writer_start = writer_start; stable = true; break;
+        }
+#if defined(__i386__) || defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+      }
+      TORCH_CHECK(stable, "Judement: transient unstable initialization");
+#ifdef SYS_pidfd_open
+      const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, local_writer_pid, 0));
+      if (pidfd < 0) return;
+      struct PidfdGuard { int fd; ~PidfdGuard() { if (fd >= 0) close(fd); } } pidfd_guard{pidfd};
+      if (process_start_ticks(local_writer_pid) != local_writer_start) return;
+      pollfd alive_check {pidfd, POLLIN, 0};
+      if (poll(&alive_check, 1, 0) != 0) return;
+      // Reader is a process-lifetime singleton; the detached worker owns only
+      // its argument and fd and never observes initialization-local state.
+      struct WatchArgs { std::atomic<bool>* alive; int fd; };
+      auto args = std::unique_ptr<WatchArgs>(new (std::nothrow) WatchArgs{&server_alive_, pidfd});
+      if (!args) return;
+      pthread_attr_t attrs;
+      if (pthread_attr_init(&attrs) != 0) return;
+      if (pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED) != 0) { pthread_attr_destroy(&attrs); return; }
+      server_alive_.store(true, std::memory_order_release);
+      pthread_t thread;
+      const int result = pthread_create(&thread, &attrs, [](void* opaque) -> void* {
+        std::unique_ptr<WatchArgs> owned(static_cast<WatchArgs*>(opaque));
+        pollfd watched {owned->fd, POLLIN, 0};
+        while (poll(&watched, 1, -1) < 0 && errno == EINTR) {}
+        owned->alive->store(false, std::memory_order_release);
+        close(owned->fd);
+        return nullptr;
+      }, args.get());
+      pthread_attr_destroy(&attrs);
+      if (result != 0) { server_alive_.store(false, std::memory_order_release); return; }
+      // pthread_create succeeded: the worker has sole responsibility for args/fd.
+      args.release();
+      pidfd_guard.fd = -1;
+#else
+      return;
+#endif
+      pid_ = local_pid; start_ticks_ = local_ticks; slots_ = local_slots;
+      generation_ = local_generation; policy_ = policy;
+      mapping_guard.release();
+      reader_ready_.store(true, std::memory_order_release);
+    });
+  }
+
+  enum class Decision { allow, deny, snapshot_exhausted };
+  Decision allowed(int device) const {
+    if (!strict_.load(std::memory_order_acquire)) {
+      return Decision::allow;
+    }
+    if (!reader_ready_.load(std::memory_order_acquire) || !policy_ || !server_alive_.load(std::memory_order_acquire) || device < 0 ||
+        device >= static_cast<int>(slots_.size()) ||
+        slots_[device] < 0 || getpid() != pid_ || start_ticks_ == 0) {
+      return Decision::deny;
+    }
+    const auto slot = static_cast<uint32_t>(slots_[device]);
+    for (int attempt = 0; attempt < 4096; ++attempt) {
+      const auto before = judement::load(&policy_->header.sequence);
+      if (before & 1) {
+#if defined(__i386__) || defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+        continue;
+      }
+      const auto generation = judement::load(&policy_->header.server_generation);
+      const auto owner = judement::load(&policy_->devices[slot].owner_pid);
+      const auto locked = judement::load(&policy_->devices[slot].lock_state);
+      bool grant = false;
+      for (const auto& entry : policy_->pids) {
+        if (judement::load(&entry.pid) != pid_) {
+          continue;
+        }
+        grant = judement::load(&entry.active) == 1 &&
+            judement::load(&entry.process_start_ticks) == start_ticks_ &&
+            judement::load(&entry.phase_id) != 0 &&
+            (judement::load(&entry.allowed_device_mask) & (uint64_t{1} << slot)) != 0;
+        break;
+      }
+      const auto after = judement::load(&policy_->header.sequence);
+      if (before == after && !(after & 1)) {
+        return generation == generation_ && owner == pid_ && locked == 1 && grant ? Decision::allow : Decision::deny;
+      }
+#if defined(__i386__) || defined(__x86_64__)
+      __builtin_ia32_pause();
+#endif
+    }
+    return Decision::snapshot_exhausted;
+  }
+
+  bool strict() const {
+    return strict_.load(std::memory_order_acquire);
+  }
+
+ private:
+  static uint64_t process_start_ticks(int32_t pid) {
+    std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
+    std::string line;
+    if (!std::getline(stat_file, line)) {
+      return 0;
+    }
+    const auto end_name = line.rfind(')');
+    if (end_name == std::string::npos || end_name + 2 >= line.size()) {
+      return 0;
+    }
+    std::istringstream fields(line.substr(end_name + 2));
+    std::string value;
+    for (int field = 3; field <= 22; ++field) {
+      if (!(fields >> value)) {
+        return 0;
+      }
+    }
+    try {
+      return std::stoull(value);
+    } catch (...) {
+      return 0;
+    }
+  }
+
+  std::once_flag init_once_;
+  std::array<int, judement::kMaxDevices> slots_ {};
+  const judement::Policy* policy_ = nullptr;
+  uint64_t generation_ = 0;
+  uint64_t start_ticks_ = 0;
+  int32_t pid_ = -1;
+  std::atomic<bool> strict_{false};
+  std::atomic<bool> reader_ready_{false};
+  std::atomic<bool> server_alive_ {false};
+};
+
+JudementPolicyReader& judement_policy_reader() {
+  static auto* reader = new JudementPolicyReader;
+  return *reader;
+}
+} // namespace
+#endif
 
 //
 // Yet another caching allocator for CUDA device allocations.
@@ -1937,6 +2144,16 @@ class DeviceCachingAllocator {
         is_expandable_segments_active);
     params.stat_types = get_stat_types_for_pool(pool);
 
+#if defined(__linux__) && !defined(USE_ROCM)
+    const auto judement_decision = judement_policy_reader().allowed(device_id);
+    TORCH_CHECK(
+        judement_decision != JudementPolicyReader::Decision::snapshot_exhausted,
+        "Judement policy snapshot_exhausted for CUDA allocation on device ", device_id);
+    TORCH_CHECK(
+        judement_decision == JudementPolicyReader::Decision::allow,
+        "Judement policy denied CUDA allocation on device ", device_id);
+#endif
+
     // First, try to get a block from the existing pool.
     bool block_found =
         // Search pool
@@ -2212,6 +2429,15 @@ class DeviceCachingAllocator {
   }
 
   Block* mallocWithAddress(size_t orig_size, cudaStream_t stream, void* addr) {
+#if defined(__linux__) && !defined(USE_ROCM)
+    const auto judement_decision = judement_policy_reader().allowed(device_id);
+    TORCH_CHECK(
+        judement_decision != JudementPolicyReader::Decision::snapshot_exhausted,
+        "Judement policy snapshot_exhausted for CUDA allocation on device ", device_id);
+    TORCH_CHECK(
+        judement_decision == JudementPolicyReader::Decision::allow,
+        "Judement policy denied CUDA allocation on device ", device_id);
+#endif
     const auto requested_addr = reinterpret_cast<uintptr_t>(addr);
     TORCH_CHECK(
         requested_addr % kMinBlockSize == 0,
@@ -5146,6 +5372,9 @@ class NativeCachingAllocator : public CUDAAllocator {
   }
 
   void init(int device_count) override {
+#if defined(__linux__) && !defined(USE_ROCM)
+    judement_policy_reader().initialize(device_count);
+#endif
     const auto size = static_cast<int64_t>(device_allocator.size());
     if (size < device_count) {
       device_allocator.resize(device_count);
@@ -5575,6 +5804,11 @@ class NativeCachingAllocator : public CUDAAllocator {
     CUDAStream stream = cuda::getCurrentCUDAStream(device);
 
     if (!isEnabled()) {
+#if defined(__linux__) && !defined(USE_ROCM)
+      TORCH_CHECK(
+          !judement_policy_reader().strict(),
+          "Judement does not support uncached CUDA allocation");
+#endif
       deleteFunc = &uncached_delete;
       devPtr = uncached_allocate(size);
     } else {
@@ -5727,6 +5961,11 @@ class NativeCachingAllocator : public CUDAAllocator {
     }
     void* r = nullptr;
     if (!isEnabled()) {
+#if defined(__linux__) && !defined(USE_ROCM)
+      TORCH_CHECK(
+          !judement_policy_reader().strict(),
+          "Judement does not support uncached CUDA allocation");
+#endif
       r = uncached_allocate(nbytes);
     } else {
       c10::DeviceIndex device = 0;
@@ -5742,6 +5981,11 @@ class NativeCachingAllocator : public CUDAAllocator {
     }
     void* r = nullptr;
     if (!isEnabled()) {
+#if defined(__linux__) && !defined(USE_ROCM)
+      TORCH_CHECK(
+          !judement_policy_reader().strict(),
+          "Judement does not support uncached CUDA allocation");
+#endif
       r = uncached_allocate(nbytes);
     } else {
       c10::DeviceIndex device = 0;

@@ -53,6 +53,7 @@ set(C10_CUDA_HEADERS
     CUDAMathCompat.h
     CUDAMiscFunctions.h
     CUDAStream.h
+    JudementPolicyV2.h
     PeerToPeerAccess.h
     impl/CUDAGraphMemory.h
     impl/CUDAGuardImpl.h

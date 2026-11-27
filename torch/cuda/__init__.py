@@ -2161,7 +2161,7 @@ def _compile_kernel(
         return getattr(result, mangled_name)
 
 
-from . import amp, graph_annotations, jiterator, nvtx, profiler, sparse, tunable
+from . import amp, graph_annotations, jiterator, judement, nvtx, profiler, sparse, tunable
 
 
 _POOL_HANDLE = NewType("_POOL_HANDLE", tuple[int, int])
@@ -2262,6 +2262,7 @@ __all__ = [
     "is_initialized",
     "is_tf32_supported",
     "jiterator",
+    "judement",
     "list_gpu_processes",
     "make_graphed_callables",
     "manual_seed",
